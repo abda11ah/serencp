@@ -57,7 +57,14 @@ systemctl start serial-getty@ttyS0.service
 QEMU/KVM example XML config:
 
 ```xml
-<console type='pty'/>
+<serial type="tcp">
+  <source mode="bind" host="127.0.0.1" service="4555" tls="no"/>
+  <protocol type="raw"/>
+  <target type="isa-serial" port="0">
+    <model name="isa-serial"/>
+  </target>
+  <alias name="serial0"/>
+</serial>
 ```
 
 ## Standard MCP Methods
