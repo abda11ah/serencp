@@ -9,12 +9,12 @@ use IO::Pty;
 use IO::Select;
 use POSIX qw(strftime WNOHANG);
 use Time::HiRes qw(sleep);
+use Fcntl qw(F_GETFL F_SETFL O_NONBLOCK);
 # Configuration
 my $DEFAULT_VM_PORT = 4555;
 my $TIMEOUT = 20;
 my $RING_BUFFER_SIZE = 1000;
 my $DEBUG = 0;  # Enable debug output
-
 # Simplified defaults for LLM use
 my $MAX_VMS = 10;
 my $READ_TIMEOUT = 5;
@@ -23,8 +23,6 @@ my $BUFFER_LINES = 500;
 my %bridges;  # VM_NAME => { pty => $pty, socket => $socket, port => $port, buffer => \@buffer, select => $select }
 my %vm_ports; # VM_NAME => port
 my $running = 1;
-
-
 # Debug output function
 sub debug {
 	my ($message) = @_;
@@ -32,10 +30,8 @@ sub debug {
 	my $timestamp = strftime("[%Y-%m-%d %H:%M:%S]", localtime);
 	print STDERR "$timestamp DEBUG: $message\n";
 }
-
 # Main select for MCP server and PTYs
 my $mcp_select = IO::Select->new(\*STDIN);
-
 # Start the MCP server
 sub start_mcp_server {
 	local $SIG{INT}  = \&cleanup;
@@ -43,15 +39,16 @@ sub start_mcp_server {
 	local $SIG{CHLD} = sub {
 		while (waitpid(-1, WNOHANG) > 0) {}
 	};
-	
-# Removed UTF-8 encoding for MCP compatibility - JSON is already UTF-8
+	# Removed UTF-8 encoding for MCP compatibility - JSON is already UTF-8
 	binmode(STDIN);
 	binmode(STDOUT);
 	local $| = 1;  # Autoflush
-	STDIN->blocking(0);  # Non-blocking STDIN
-
+	 # --- Reliable non‑blocking STDIN ---
+	my $flags = fcntl(STDIN, F_GETFL, 0)
+		or die "Can't get flags for STDIN: $!";
+	fcntl(STDIN, F_SETFL, $flags | O_NONBLOCK)
+		or die "Can't set STDIN nonblocking: $!";
 	debug("Starting VM Serial MCP Server...");
-
 	while ($running) {
 		my @ready = $mcp_select->can_read(1);
 		for my $fh (@ready) {
@@ -113,7 +110,6 @@ sub start_mcp_server {
 		}
 	}
 }
-
 sub handle_socket_connection {
 	my ($vm_name) = @_;
 	my $bridge = $bridges{$vm_name};
@@ -123,7 +119,6 @@ sub handle_socket_connection {
 		$bridge->{clients}->{$client_id} = $client;
 		$mcp_select->add($client);
 		debug("Server: New Unix client connected for $vm_name (ID $client_id)");
-		
 		# Send recent history (last 50 lines) to new client
 		if (@{$bridge->{buffer}}) {
 			my $start = @{$bridge->{buffer}} > 50 ? @{$bridge->{buffer}} - 50 : 0;
@@ -132,7 +127,6 @@ sub handle_socket_connection {
 		}
 	}
 }
-
 sub handle_client_data {
 	my ($vm_name, $client) = @_;
 	my $bridge = $bridges{$vm_name};
@@ -150,7 +144,6 @@ sub handle_client_data {
 		close $client;
 	}
 }
-
 sub handle_pty_data {
 	my ($pty) = @_;
 	# Find which VM this PTY belongs to
@@ -162,12 +155,10 @@ sub handle_pty_data {
 		}
 	}
 	return unless $vm_name;
-
 	my $bridge = $bridges{$vm_name};
 	my $buffer;
 	my $bytes = sysread($pty, $buffer, 4096);
 	return if $!{EINTR} || $!{EAGAIN};
-	
 	if (defined $bytes && $bytes > 0) {
 		debug("Server: Read $bytes bytes from VM $vm_name via PTY");
 		my $text = $buffer;
@@ -176,7 +167,6 @@ sub handle_pty_data {
 			push @{$bridge->{buffer}}, $l if $l;
 			shift @{$bridge->{buffer}} while @{$bridge->{buffer}} > $BUFFER_LINES;
 		}
-		
 		# Forward to all connected Unix socket clients
 		for my $client (values %{$bridge->{clients}}) {
 			eval { syswrite($client, $buffer); };
@@ -192,7 +182,11 @@ sub handle_pty_data {
 my %TOOLS = (
 	start => {
 		description => "Start the bridge for VM serial console communication.",
-		inputSchema => {type => "object",properties => {VM_NAME => { type => "string", description => "Name of the VM" },PORT => { type => "string", description => "Port number for VM serial console (default: 4555)" }},required => ["VM_NAME"]},
+		inputSchema => {
+			type => "object",
+			properties => {VM_NAME => { type => "string", description => "Name of the VM" },PORT => { type => "string", description => "Port number for VM serial console (default: 4555)" }},
+			required => ["VM_NAME"]
+		},
 		handler => \&tool_serial_start
 	},
 	stop => {
@@ -212,11 +206,14 @@ my %TOOLS = (
 	},
 	write => {
 		description => "Send a command to the VM serial console.",
-		inputSchema => {type => "object",properties => {VM_NAME => { type => "string", description => "Name of the VM" },text => { type => "string", description => "Command to send to the VM" }},required => ["VM_NAME","text"]},
+		inputSchema => {
+			type => "object",
+			properties => {VM_NAME => { type => "string", description => "Name of the VM" },text => { type => "string", description => "Command to send to the VM" }},
+			required => ["VM_NAME","text"]
+		},
 		handler => \&tool_serial_write
 	}
 );
-
 # Handle JSON RPC requests
 sub handle_request {
 	my ($request) = @_;
@@ -224,23 +221,13 @@ sub handle_request {
 	my $method = $request->{method};
 	my $params = $request->{params} || {};
 	my $id = $request->{id};
-
 	# Validate JSON RPC 2.0 (standard says notifications have no ID, so we only validate for requests)
 	if (defined $id && (!$request->{jsonrpc} || $request->{jsonrpc} ne '2.0')) {
 		return {jsonrpc => "2.0", error => {code => -32600, message => "Invalid JSON-RPC 2.0 request"}, id => $id};
 	}
-
 	# Handle MCP methods
 	if ($method eq 'initialize') {
-		return {
-			jsonrpc => "2.0",
-			id => $id,
-			result => {
-				protocolVersion => "2024-11-05",
-				capabilities => { tools => {} },
-				serverInfo => {name => "vm-serial", version => "1.0.0"}
-			}
-		};
+		return {jsonrpc => "2.0",id => $id,result => {protocolVersion => "2024-11-05",capabilities => { tools => {} },serverInfo => {name => "vm-serial", version => "1.0.0"}}};
 	}
 	if ($method eq 'notifications/initialized') {
 		return; # Notification: no response
@@ -256,27 +243,18 @@ sub handle_request {
 		my $args = $params->{arguments} || {};
 		if (my $tool = $TOOLS{$name}) {
 			my $res = $tool->{handler}->($args);
-			return {
-				jsonrpc => "2.0",
-				id => $id,
-				result => {
-					content => [ { type => "text", text => encode_json($res) } ]
-				}
-			};
+			return {jsonrpc => "2.0",id => $id,result => {content => [ { type => "text", text => encode_json($res) } ]}};
 		}
 		return { jsonrpc => "2.0", id => $id, error => { code => -32601, message => "Tool not found: $name" } };
 	}
-
 	# Legacy support for direct method calls if needed
 	if (my $tool = $TOOLS{$method}) {
 		my $res = $tool->{handler}->($params);
 		return { jsonrpc => "2.0", id => $id, result => $res };
 	}
-
 	return { jsonrpc => "2.0", id => $id, error => { code => -32601, message => "Method not found: $method" } } if defined $id;
 	return;
 }
-
 # Tool: Start VM serial bridge
 sub tool_serial_start {
 	my ($params) = @_;
@@ -290,7 +268,6 @@ sub tool_serial_start {
 	}
 	return start_bridge($vm_name, $port);
 }
-
 # Tool: Stop VM serial bridge
 sub tool_serial_stop {
 	my ($params) = @_;
@@ -302,7 +279,6 @@ sub tool_serial_stop {
 	stop_bridge($vm_name);
 	return {success => 1, message => "Bridge stopped for VM: $vm_name"};
 }
-
 # Tool: Check VM serial bridge status
 sub tool_serial_status {
 	my ($params) = @_;
@@ -310,7 +286,6 @@ sub tool_serial_status {
 	return {error => "VM_NAME parameter is required"} unless $vm_name;
 	return bridge_status($vm_name);
 }
-
 # Tool: Read from VM serial console
 sub tool_serial_read {
 	my ($params) = @_;
@@ -320,7 +295,6 @@ sub tool_serial_read {
 	return {error => "Bridge not running for VM: $vm_name. Use start to start it."} unless bridge_exists($vm_name);
 	return read_from_vm($vm_name);
 }
-
 # Tool: Write to VM serial console
 sub tool_serial_write {
 	my ($params) = @_;
@@ -353,7 +327,6 @@ sub start_bridge {
 	$port = $DEFAULT_VM_PORT unless defined $port;
 	$vm_ports{$vm_name} = $port;
 	debug("Creating bridge for $vm_name on port $port");
-	
 	# Create PTY
 	my $pty = IO::Pty->new();
 	die "Failed to create PTY" unless $pty;
@@ -367,17 +340,12 @@ sub start_bridge {
 	if ($pid == 0) {
 		# Child process - handle the bridge
 		close($read_pipe); # Child doesn't need read end
-		# Don't close PTY - keep slave end for communication
+		 # Don't close PTY - keep slave end for communication
 		my $pty_slave = $pty->slave();
 		$pty->close();  # Close master end in child
-		# Try to connect to VM serial console (raw TCP)
+		 # Try to connect to VM serial console (raw TCP)
 		debug("Child process: Attempting to connect to VM serial console on port $port");
-		my $vm_socket = IO::Socket::INET->new(
-			PeerAddr => '127.0.0.1',
-			PeerPort => $port,
-			Proto    => 'tcp',
-			Timeout  => 5
-		);
+		my $vm_socket = IO::Socket::INET->new(PeerAddr => '127.0.0.1',PeerPort => $port,Proto    => 'tcp',Timeout  => 5);
 		if ($vm_socket) {
 			debug("Child process: Connected to VM serial console successfully");
 			# Connection successful - signal parent
@@ -398,7 +366,7 @@ sub start_bridge {
 	}
 	# Parent process - wait for child to be ready
 	close($write_pipe); # Parent doesn't need write end
-	# Create socket
+	 # Create socket
 	my $socket_path = "/tmp/serial_${vm_name}";
 	debug("Parent process: Creating Unix socket at $socket_path");
 	unlink $socket_path if -e $socket_path;
@@ -435,11 +403,9 @@ sub start_bridge {
 		debug("Parent process: Storing bridge info");
 		# Store bridge info
 		$bridges{$vm_name} = {pty => $pty,socket => $socket,port => $port,buffer => [],pid => $pid,clients => {}};
-		
 		# Register PTY and Unix socket in main select loop
 		$mcp_select->add($pty);
 		$mcp_select->add($socket);
-		
 		return {success => 1,message => "Bridge started for VM: $vm_name",port => $port,socket => $socket_path};
 	} else {
 		debug("Parent process: Bridge setup failed - cleaning up");
@@ -471,11 +437,9 @@ sub get_available_port {
 sub bridge_process_child {
 	my ($vm_socket, $pty_slave) = @_;
 	debug("Bridge child: Starting data bridge between VM and PTY");
-	
 	# Buffer to capture initial output
 	my @initial_buffer;
 	my $initial_buffer_size = 200;
-	
 	# First, read existing output from VM (up to 200 lines)
 	debug("Bridge child: Reading existing output from VM");
 	my $read_start = time();
@@ -503,14 +467,11 @@ sub bridge_process_child {
 		$vm_socket->blocking(0);
 	}
 	$vm_socket->blocking(1);  # Reset to blocking mode
-	
 	debug("Bridge child: Initial output captured: " . scalar(@initial_buffer) . " lines");
-	
 	# Set up select for multiplexing VM socket and PTY slave
 	my $select = IO::Select->new();
 	$select->add($vm_socket);
 	$select->add($pty_slave);  # Read commands from parent via PTY
-	
 	my $loop_count = 0;
 	# Main loop
 	while (1) {
@@ -523,7 +484,6 @@ sub bridge_process_child {
 			alarm(0);
 		};
 		alarm(0);
-		
 		for my $fh (@ready) {
 			if ($fh == $vm_socket) {
 				# Data from VM → PTY slave → PTY master → parent
@@ -541,8 +501,7 @@ sub bridge_process_child {
 					syswrite($pty_slave, $buffer);
 					next if $!{EINTR} || $!{EAGAIN};
 				}
-			}
-			elsif ($fh == $pty_slave) {
+			}elsif ($fh == $pty_slave) {
 				# Commands from parent PTY master → VM socket
 				my $buffer;
 				my $bytes = sysread($pty_slave, $buffer, 4096);
@@ -626,11 +585,9 @@ sub read_from_vm {
 	my ($vm_name) = @_;
 	debug("Reading from VM: $vm_name");
 	return {error => "No bridge running for VM: $vm_name"} unless bridge_exists($vm_name);
-	
 	my $bridge = $bridges{$vm_name};
 	my @lines = @{$bridge->{buffer}};
 	debug("VM buffer has " . scalar(@lines) . " lines");
-	
 	# Always return last 100 lines
 	my $start = @lines > 100 ? @lines - 100 : 0;
 	my $output = join("\n", @lines[$start..$#lines]);
@@ -656,16 +613,13 @@ sub monitor_bridge {
 	my ($vm_name) = @_;
 	my $bridge = $bridges{$vm_name};
 	debug("Monitor: Starting bridge monitoring for $vm_name");
-	
 	# Create separate select for monitoring PTY and Unix socket
 	my $monitor_select = IO::Select->new();
 	$monitor_select->add($bridge->{pty});      # Read VM output from PTY master
 	$monitor_select->add($bridge->{socket});    # Accept terminal-control clients
-	
 	# Track connected clients
 	$bridge->{clients} = {};
 	debug("Monitor: Ready to monitor PTY and Unix socket");
-	
 	my $monitor_loop = 0;
 	while (1) {
 		$monitor_loop++;
@@ -677,10 +631,8 @@ sub monitor_bridge {
 			alarm(0);
 		};
 		alarm(0);
-		
 		# Check if bridge still exists (parent might have cleaned it up)
 		last unless exists $bridges{$vm_name};
-		
 		for my $fh (@ready) {
 			if ($fh == $bridge->{pty}) {
 				# VM data from PTY master → buffer + all clients
@@ -689,7 +641,6 @@ sub monitor_bridge {
 				next if $!{EINTR} || $!{EAGAIN};
 				if (defined $bytes && $bytes > 0) {
 					debug("Monitor: Read $bytes bytes from VM via PTY");
-					
 					# Update buffer for read
 					my $text = $buffer;
 					$text =~ s/\r/\n/g;
@@ -697,7 +648,6 @@ sub monitor_bridge {
 						push @{$bridge->{buffer}}, $l if $l;
 						shift @{$bridge->{buffer}} while @{$bridge->{buffer}} > $RING_BUFFER_SIZE;
 					}
-					
 					# Forward to all connected terminal-control clients
 					my $client_count = scalar(keys %{$bridge->{clients}});
 					debug("Monitor: Forwarding to $client_count clients");
@@ -708,8 +658,7 @@ sub monitor_bridge {
 				} else {
 					debug("Monitor: No data from VM PTY");
 				}
-			}
-			elsif ($fh == $bridge->{socket}) {
+			}elsif ($fh == $bridge->{socket}) {
 				# New terminal-control client connection
 				my $client = $bridge->{socket}->accept();
 				if ($client) {
@@ -717,7 +666,6 @@ sub monitor_bridge {
 					$bridge->{clients}->{$client_id} = $client;
 					$monitor_select->add($client);
 					debug("Monitor: New client connected with ID $client_id");
-					
 					# Send current buffer content to new client
 					if (@{$bridge->{buffer}}) {
 						my $history = join("\n", @{$bridge->{buffer}}[-50..$#{$bridge->{buffer}}]) . "\n";
@@ -726,8 +674,7 @@ sub monitor_bridge {
 						next if $!{EINTR} || $!{EAGAIN};
 					}
 				}
-			}
-			elsif (exists $bridge->{clients}->{fileno($fh)}) {
+			}elsif (exists $bridge->{clients}->{fileno($fh)}) {
 				# Data from terminal-control client → VM via PTY master
 				my $buffer;
 				my $bytes = sysread($fh, $buffer, 4096);
@@ -746,7 +693,6 @@ sub monitor_bridge {
 				}
 			}
 		}
-		
 		# Periodic status update
 		if ($monitor_loop % 500 == 0) {
 			my $client_count = scalar(keys %{$bridge->{clients}});
