@@ -18,7 +18,6 @@ my $DEBUG = 0;  # Enable debug output
 # Simplified defaults for LLM use
 my $MAX_VMS = 10;
 my $READ_TIMEOUT = 5;
-my $BUFFER_LINES = 500;
 # Global state
 my %bridges;  # VM_NAME => { pty => $pty, socket => $socket, port => $port, buffer => \@buffer, select => $select }
 my %vm_ports; # VM_NAME => port
@@ -88,16 +87,8 @@ sub start_mcp_server {
 				my $handled = 0;
 				for my $name (keys %bridges) {
 					my $bridge = $bridges{$name};
-					if ($fh == $bridge->{pty}) {
-						handle_pty_data($fh);
-						$handled = 1;
-						last;
-					} elsif ($fh == $bridge->{socket}) {
-						handle_socket_connection($name);
-						$handled = 1;
-						last;
-					} elsif (exists $bridge->{clients}->{fileno($fh)}) {
-						handle_client_data($name, $fh);
+					if ($fh == $bridge->{pty} || $fh == $bridge->{socket} || exists $bridge->{clients}->{fileno($fh)}) {
+						monitor_bridge($name, $fh);
 						$handled = 1;
 						last;
 					}
@@ -110,74 +101,7 @@ sub start_mcp_server {
 		}
 	}
 }
-sub handle_socket_connection {
-	my ($vm_name) = @_;
-	my $bridge = $bridges{$vm_name};
-	my $client = $bridge->{socket}->accept();
-	if ($client) {
-		my $client_id = fileno($client);
-		$bridge->{clients}->{$client_id} = $client;
-		$mcp_select->add($client);
-		debug("Server: New Unix client connected for $vm_name (ID $client_id)");
-		# Send recent history (last 50 lines) to new client
-		if (@{$bridge->{buffer}}) {
-			my $start = @{$bridge->{buffer}} > 50 ? @{$bridge->{buffer}} - 50 : 0;
-			my $history = join("\n", @{$bridge->{buffer}}[$start..$#{$bridge->{buffer}}]) . "\n";
-			syswrite($client, $history);
-		}
-	}
-}
-sub handle_client_data {
-	my ($vm_name, $client) = @_;
-	my $bridge = $bridges{$vm_name};
-	my $buffer;
-	my $bytes = sysread($client, $buffer, 4096);
-	if (defined $bytes && $bytes > 0) {
-		debug("Server: Read $bytes bytes from Unix client for $vm_name, forwarding to VM");
-		syswrite($bridge->{pty}, $buffer);
-	} else {
-		# Disconnection or error
-		my $client_id = fileno($client);
-		debug("Server: Unix client $client_id disconnected from $vm_name");
-		$mcp_select->remove($client);
-		delete $bridge->{clients}->{$client_id};
-		close $client;
-	}
-}
-sub handle_pty_data {
-	my ($pty) = @_;
-	# Find which VM this PTY belongs to
-	my $vm_name;
-	for my $name (keys %bridges) {
-		if ($bridges{$name}->{pty} == $pty) {
-			$vm_name = $name;
-			last;
-		}
-	}
-	return unless $vm_name;
-	my $bridge = $bridges{$vm_name};
-	my $buffer;
-	my $bytes = sysread($pty, $buffer, 4096);
-	return if $!{EINTR} || $!{EAGAIN};
-	if (defined $bytes && $bytes > 0) {
-		debug("Server: Read $bytes bytes from VM $vm_name via PTY");
-		my $text = $buffer;
-		$text =~ s/\r/\n/g;
-		for my $l (split /\n/, $text) {
-			push @{$bridge->{buffer}}, $l if $l;
-			shift @{$bridge->{buffer}} while @{$bridge->{buffer}} > $BUFFER_LINES;
-		}
-		# Forward to all connected Unix socket clients
-		for my $client (values %{$bridge->{clients}}) {
-			eval { syswrite($client, $buffer); };
-		}
-	} elsif (defined $bytes && $bytes == 0) {
-		debug("Server: PTY for $vm_name signaled EOF - VM bridge likely died");
-		# Auto-restart bridge
-		debug("VM disconnected - auto-restart bridge for $vm_name");
-		start_bridge($vm_name, $bridge->{port});
-	}
-}
+
 # Tool definitions
 my %TOOLS = (
 	start => {
@@ -588,8 +512,10 @@ sub read_from_vm {
 	my $bridge = $bridges{$vm_name};
 	my @lines = @{$bridge->{buffer}};
 	debug("VM buffer has " . scalar(@lines) . " lines");
-	# Always return last 100 lines
-	my $start = @lines > 100 ? @lines - 100 : 0;
+	# Always return last 100 lines (or fewer if buffer is smaller)
+	my $return_lines = 100;
+	$return_lines = $RING_BUFFER_SIZE if $RING_BUFFER_SIZE < $return_lines;
+	my $start = @lines > $return_lines ? @lines - $return_lines : 0;
 	my $output = join("\n", @lines[$start..$#lines]);
 	debug("Returning VM output: " . length($output) . " characters");
 	return {success => 1, output => $output};
@@ -608,98 +534,74 @@ sub write_to_vm {
 	debug("PTY write result: $bytes bytes");
 	return $bytes > 0;
 }
-# Monitor bridge for PTY and Unix socket communication
+# Monitor bridge for PTY and Unix socket communication (single filehandle processing)
 sub monitor_bridge {
-	my ($vm_name) = @_;
+	my ($vm_name, $fh) = @_;
 	my $bridge = $bridges{$vm_name};
-	debug("Monitor: Starting bridge monitoring for $vm_name");
-	# Create separate select for monitoring PTY and Unix socket
-	my $monitor_select = IO::Select->new();
-	$monitor_select->add($bridge->{pty});      # Read VM output from PTY master
-	$monitor_select->add($bridge->{socket});    # Accept terminal-control clients
-	# Track connected clients
-	$bridge->{clients} = {};
-	debug("Monitor: Ready to monitor PTY and Unix socket");
-	my $monitor_loop = 0;
-	while (1) {
-		$monitor_loop++;
-		my @ready;
-		eval {
-			local $SIG{ALRM} = sub { die "timeout\n" };
-			alarm(1);
-			@ready = $monitor_select->can_read(1);
-			alarm(0);
-		};
-		alarm(0);
-		# Check if bridge still exists (parent might have cleaned it up)
-		last unless exists $bridges{$vm_name};
-		for my $fh (@ready) {
-			if ($fh == $bridge->{pty}) {
-				# VM data from PTY master → buffer + all clients
-				my $buffer;
-				my $bytes = sysread($bridge->{pty}, $buffer, 4096);
+	return unless $bridge;
+	
+	if ($fh == $bridge->{pty}) {
+		# VM data from PTY master → buffer + all clients
+		my $buffer;
+		my $bytes = sysread($bridge->{pty}, $buffer, 4096);
+		next if $!{EINTR} || $!{EAGAIN};
+		if (defined $bytes && $bytes > 0) {
+			debug("Monitor: Read $bytes bytes from VM via PTY");
+			# Update buffer for read
+			my $text = $buffer;
+			$text =~ s/\r/\n/g;
+			for my $l (split /\n/, $text) {
+				push @{$bridge->{buffer}}, $l if $l;
+				shift @{$bridge->{buffer}} while @{$bridge->{buffer}} > $RING_BUFFER_SIZE;
+			}
+			# Forward to all connected terminal-control clients
+			my $client_count = scalar(keys %{$bridge->{clients}});
+			debug("Monitor: Forwarding to $client_count clients");
+			for my $client (values %{$bridge->{clients}}) {
+				eval { syswrite($client, $buffer); };
 				next if $!{EINTR} || $!{EAGAIN};
-				if (defined $bytes && $bytes > 0) {
-					debug("Monitor: Read $bytes bytes from VM via PTY");
-					# Update buffer for read
-					my $text = $buffer;
-					$text =~ s/\r/\n/g;
-					for my $l (split /\n/, $text) {
-						push @{$bridge->{buffer}}, $l if $l;
-						shift @{$bridge->{buffer}} while @{$bridge->{buffer}} > $RING_BUFFER_SIZE;
-					}
-					# Forward to all connected terminal-control clients
-					my $client_count = scalar(keys %{$bridge->{clients}});
-					debug("Monitor: Forwarding to $client_count clients");
-					for my $client (values %{$bridge->{clients}}) {
-						eval { syswrite($client, $buffer); };
-						next if $!{EINTR} || $!{EAGAIN};
-					}
-				} else {
-					debug("Monitor: No data from VM PTY");
-				}
-			}elsif ($fh == $bridge->{socket}) {
-				# New terminal-control client connection
-				my $client = $bridge->{socket}->accept();
-				if ($client) {
-					my $client_id = fileno($client);
-					$bridge->{clients}->{$client_id} = $client;
-					$monitor_select->add($client);
-					debug("Monitor: New client connected with ID $client_id");
-					# Send current buffer content to new client
-					if (@{$bridge->{buffer}}) {
-						my $history = join("\n", @{$bridge->{buffer}}[-50..$#{$bridge->{buffer}}]) . "\n";
-						debug("Monitor: Sending history (" . length($history) . " bytes) to new client");
-						eval { syswrite($client, $history); };
-						next if $!{EINTR} || $!{EAGAIN};
-					}
-				}
-			}elsif (exists $bridge->{clients}->{fileno($fh)}) {
-				# Data from terminal-control client → VM via PTY master
-				my $buffer;
-				my $bytes = sysread($fh, $buffer, 4096);
+			}
+		} elsif (defined $bytes && $bytes == 0) {
+			debug("Server: PTY for $vm_name signaled EOF - VM bridge likely died");
+			# Auto-restart bridge
+			debug("VM disconnected - auto-restart bridge for $vm_name");
+			start_bridge($vm_name, $bridge->{port});
+		}
+	} elsif ($fh == $bridge->{socket}) {
+		# New terminal-control client connection
+		my $client = $bridge->{socket}->accept();
+		if ($client) {
+			my $client_id = fileno($client);
+			$bridge->{clients}->{$client_id} = $client;
+			$mcp_select->add($client);
+			debug("Monitor: New client connected with ID $client_id");
+			# Send current buffer content to new client
+			if (@{$bridge->{buffer}}) {
+				my $start = @{$bridge->{buffer}} > 50 ? @{$bridge->{buffer}} - 50 : 0;
+				my $history = join("\n", @{$bridge->{buffer}}[$start..$#{$bridge->{buffer}}]) . "\n";
+				debug("Monitor: Sending history (" . length($history) . " bytes) to new client");
+				eval { syswrite($client, $history); };
 				next if $!{EINTR} || $!{EAGAIN};
-				if ($bytes) {
-					debug("Monitor: Read $bytes bytes from client, forwarding to VM");
-					syswrite($bridge->{pty}, $buffer);
-					next if $!{EINTR} || $!{EAGAIN};
-				} else {
-					# Client disconnected
-					my $client_id = fileno($fh);
-					debug("Monitor: Client $client_id disconnected");
-					$monitor_select->remove($fh);
-					delete $bridge->{clients}->{$client_id};
-					close $fh;
-				}
 			}
 		}
-		# Periodic status update
-		if ($monitor_loop % 500 == 0) {
-			my $client_count = scalar(keys %{$bridge->{clients}});
-			debug("Monitor: Status - Loop $monitor_loop, $client_count clients, buffer size: " . scalar(@{$bridge->{buffer}}));
+	} elsif (exists $bridge->{clients}->{fileno($fh)}) {
+		# Data from terminal-control client → VM via PTY master
+		my $buffer;
+		my $bytes = sysread($fh, $buffer, 4096);
+		next if $!{EINTR} || $!{EAGAIN};
+		if (defined $bytes && $bytes > 0) {
+			debug("Monitor: Read $bytes bytes from client, forwarding to VM");
+			syswrite($bridge->{pty}, $buffer);
+			next if $!{EINTR} || $!{EAGAIN};
+		} else {
+			# Client disconnected
+			my $client_id = fileno($fh);
+			debug("Monitor: Client $client_id disconnected");
+			$mcp_select->remove($fh);
+			delete $bridge->{clients}->{$client_id};
+			close $fh;
 		}
 	}
-	debug("Monitor: Bridge monitoring ended for $vm_name");
 }
 # Cleanup on exit
 sub cleanup {
