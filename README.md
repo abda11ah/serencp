@@ -11,7 +11,7 @@ It uses `IO::Pty` to create a pseudo-terminal (PTY) for the VM serial console. I
 ### Core Features:
 - **Persistent PTY**: Maintains a stable connection to the VM serial console.
 - **Auto-Restart**: Automatically detects VM disconnects and restarts the bridge for persistent interaction.
-- **Ring Buffer**: Maintains a ring buffer of the last 500 lines of output.
+- **Ring Buffer**: Maintains a ring buffer of the last 1000 lines of output.
 - **Multi-Client Access**: Supports multiple simultaneous clients via a Unix socket at `/tmp/serial_${VM_NAME}`.
 - **Standard MCP**: Supports standard `tools/list` and `tools/call` methods for tool discovery and execution.
 - **Zombie Management**: Built-in process reaper prevents zombie processes from forks.

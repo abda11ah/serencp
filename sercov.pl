@@ -44,9 +44,9 @@ sub start_mcp_server {
 	local $| = 1;  # Autoflush
 	 # --- Reliable non‑blocking STDIN ---
 	my $flags = fcntl(STDIN, F_GETFL, 0)
-		or die "Can't get flags for STDIN: $!";
+		or do { warn "Can't get flags for STDIN: $!"; exit(1) };
 	fcntl(STDIN, F_SETFL, $flags | O_NONBLOCK)
-		or die "Can't set STDIN nonblocking: $!";
+		or do { warn "Can't set STDIN nonblocking: $!"; exit(1) };
 	debug("Starting VM Serial MCP Server...");
 	while ($running) {
 		my @ready = $mcp_select->can_read(1);
@@ -208,7 +208,13 @@ sub tool_serial_status {
 	my ($params) = @_;
 	my $vm_name = $params->{VM_NAME} || $params->{vm_name};
 	return {error => "VM_NAME parameter is required"} unless $vm_name;
-	return bridge_status($vm_name);
+	return do {
+		if (bridge_exists($vm_name)) {
+			{running => 1,vm_name => $vm_name,port => $vm_ports{$vm_name},buffer_size => scalar(@{$bridges{$vm_name}->{buffer}})};
+		} else {
+			{running => 0,vm_name => $vm_name,port => undef,buffer_size => 0};
+		}
+	};
 }
 # Tool: Read from VM serial console
 sub tool_serial_read {
@@ -217,7 +223,18 @@ sub tool_serial_read {
 	debug("Read request for VM: $vm_name");
 	return {error => "VM_NAME parameter is required"} unless $vm_name;
 	return {error => "Bridge not running for VM: $vm_name. Use start to start it."} unless bridge_exists($vm_name);
-	return read_from_vm($vm_name);
+	return do {
+		my $bridge = $bridges{$vm_name};
+		my @lines = @{$bridge->{buffer}};
+		debug("VM buffer has " . scalar(@lines) . " lines");
+		# Always return last 100 lines (or fewer if buffer is smaller)
+		my $return_lines = 100;
+		$return_lines = $RING_BUFFER_SIZE if $RING_BUFFER_SIZE < $return_lines;
+		my $start = @lines > $return_lines ? @lines - $return_lines : 0;
+		my $output = join("\n", @lines[$start..$#lines]);
+		debug("Returning VM output: " . length($output) . " characters");
+		{success => 1, output => $output};
+	};
 }
 # Tool: Write to VM serial console
 sub tool_serial_write {
@@ -227,7 +244,18 @@ sub tool_serial_write {
 	debug("Write request for VM: $vm_name with text: '$text'");
 	return {error => "VM_NAME and text parameters are required"} unless $vm_name && defined $text;
 	return {error => "Bridge not running for VM: $vm_name. Use start to start it."} unless bridge_exists($vm_name);
-	my $result = write_to_vm($vm_name, $text);
+	my $result = do {
+		my $bridge = $bridges{$vm_name};
+		debug("Writing to VM: $vm_name text: '$text'");
+		return 0 unless $bridge && $bridge->{pty};
+		# Add newline if not present
+		$text .= "\n" unless $text =~ /\n$/;
+		debug("Writing to PTY: " . length($text) . " bytes");
+		# Write to PTY
+		my $bytes = syswrite($bridge->{pty}, $text);
+		debug("PTY write result: $bytes bytes");
+		$bytes > 0;
+	};
 	debug("Write result: " . ($result ? "SUCCESS" : "FAILED"));
 	return {success => $result, message => $result ? "Command sent successfully" : "Failed to send command"};
 }
@@ -236,15 +264,7 @@ sub bridge_exists {
 	my ($vm_name) = @_;
 	return exists $bridges{$vm_name} && $bridges{$vm_name}->{pty};
 }
-# Get bridge status
-sub bridge_status {
-	my ($vm_name) = @_;
-	if (bridge_exists($vm_name)) {
-		return {running => 1,vm_name => $vm_name,port => $vm_ports{$vm_name},buffer_size => scalar(@{$bridges{$vm_name}->{buffer}})};
-	} else {
-		return {running => 0,vm_name => $vm_name,port => undef,buffer_size => 0};
-	}
-}
+
 # Start bridge for VM
 sub start_bridge {
 	my ($vm_name, $port) = @_;
@@ -253,14 +273,23 @@ sub start_bridge {
 	debug("Creating bridge for $vm_name on port $port");
 	# Create PTY
 	my $pty = IO::Pty->new();
-	die "Failed to create PTY" unless $pty;
+	unless ($pty) {
+		debug("Failed to create PTY");
+		return {success => 0, error => "Failed to create PTY for VM: $vm_name"};
+	}
 	debug("PTY created successfully");
 	# Create a pipe for child to signal readiness
 	my ($read_pipe, $write_pipe);
-	pipe($read_pipe, $write_pipe) or die "Failed to create pipe: $!";
+	unless (pipe($read_pipe, $write_pipe)) {
+		debug("Failed to create pipe: $!");
+		return {success => 0, error => "Failed to create communication pipe for VM: $vm_name"};
+	}
 	# Fork to handle the bridge
 	my $pid = fork();
-	die "Failed to fork" unless defined $pid;
+	unless (defined $pid) {
+		debug("Failed to fork");
+		return {success => 0, error => "Failed to fork bridge process for VM: $vm_name"};
+	}
 	if ($pid == 0) {
 		# Child process - handle the bridge
 		close($read_pipe); # Child doesn't need read end
@@ -290,11 +319,17 @@ sub start_bridge {
 	}
 	# Parent process - wait for child to be ready
 	close($write_pipe); # Parent doesn't need write end
-	 # Create socket
+	# Create socket
 	my $socket_path = "/tmp/serial_${vm_name}";
 	debug("Parent process: Creating Unix socket at $socket_path");
 	unlink $socket_path if -e $socket_path;
-	my $socket = IO::Socket::UNIX->new(Type => SOCK_STREAM,Local => $socket_path,Listen => 1) or die "Failed to create socket: $!";
+	my $socket = IO::Socket::UNIX->new(Type => SOCK_STREAM,Local => $socket_path,Listen => 1);
+	unless ($socket) {
+		debug("Failed to create socket: $!");
+		kill('TERM', $pid) if $pid;
+		$pty->close();
+		return {success => 0, error => "Failed to create Unix socket for VM: $vm_name"};
+	}
 	debug("Parent process: Unix socket created successfully");
 	# Set up select - add pipe to monitor child readiness
 	my $select = IO::Select->new();
@@ -341,22 +376,7 @@ sub start_bridge {
 		return {success => 0,message => "Failed to start bridge for VM: $vm_name - connection timeout"};
 	}
 }
-# Get available port
-sub get_available_port {
-	# Simple port allocation - start from 4555 and increment
-	my $port = $DEFAULT_VM_PORT;
-	while (1) {
-		my $available = 1;
-		for my $bridge (values %bridges) {
-			if ($bridge->{port} == $port) {
-				$available = 0;
-				last;
-			}
-		}
-		return $port if $available;
-		$port++;
-	}
-}
+
 # Bridge process (child) - simplified version for child process
 sub bridge_process_child {
 	my ($vm_socket, $pty_slave) = @_;
@@ -452,38 +472,7 @@ sub bridge_process_child {
 	close $vm_socket;
 	close $pty_slave;
 }
-# Bridge process (original version for compatibility)
-sub bridge_process {
-	my ($vm_name, $port) = @_;
-	# Connect to VM serial console
-	my $vm_socket = IO::Socket::INET->new(PeerAddr => '127.0.0.1',PeerPort => $port,Proto => 'tcp');
-	unless ($vm_socket) {
-		warn "Failed to connect to VM serial console on port $port: $!";
-		exit(1);
-	}
-	# Set up select for multiplexing
-	my $select = IO::Select->new();
-	$select->add($vm_socket);
-	# Main loop
-	while (1) {
-		my @ready = $select->can_read(1);
-		for my $fh (@ready) {
-			if ($fh == $vm_socket) {
-				# Data from VM
-				my $buffer;
-				my $bytes = sysread($vm_socket, $buffer, 4096);
-				next if $!{EINTR} || $!{EAGAIN};
-				if (!$bytes) {
-					# VM disconnected
-					last;
-				}
-				# Write to stdout (will be captured by parent)
-				print STDOUT $buffer;
-			}
-		}
-	}
-	close $vm_socket;
-}
+
 # Stop bridge for VM
 sub stop_bridge {
 	my ($vm_name) = @_;
@@ -504,36 +493,8 @@ sub stop_bridge {
 	delete $bridges{$vm_name};
 	delete $vm_ports{$vm_name};
 }
-# Read from VM - simplified for LLM
-sub read_from_vm {
-	my ($vm_name) = @_;
-	debug("Reading from VM: $vm_name");
-	return {error => "No bridge running for VM: $vm_name"} unless bridge_exists($vm_name);
-	my $bridge = $bridges{$vm_name};
-	my @lines = @{$bridge->{buffer}};
-	debug("VM buffer has " . scalar(@lines) . " lines");
-	# Always return last 100 lines (or fewer if buffer is smaller)
-	my $return_lines = 100;
-	$return_lines = $RING_BUFFER_SIZE if $RING_BUFFER_SIZE < $return_lines;
-	my $start = @lines > $return_lines ? @lines - $return_lines : 0;
-	my $output = join("\n", @lines[$start..$#lines]);
-	debug("Returning VM output: " . length($output) . " characters");
-	return {success => 1, output => $output};
-}
-# Write to VM
-sub write_to_vm {
-	my ($vm_name, $text) = @_;
-	my $bridge = $bridges{$vm_name};
-	debug("Writing to VM: $vm_name text: '$text'");
-	return 0 unless $bridge && $bridge->{pty};
-	# Add newline if not present
-	$text .= "\n" unless $text =~ /\n$/;
-	debug("Writing to PTY: " . length($text) . " bytes");
-	# Write to PTY
-	my $bytes = syswrite($bridge->{pty}, $text);
-	debug("PTY write result: $bytes bytes");
-	return $bytes > 0;
-}
+
+
 # Monitor bridge for PTY and Unix socket communication (single filehandle processing)
 sub monitor_bridge {
 	my ($vm_name, $fh) = @_;
