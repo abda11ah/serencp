@@ -61,6 +61,23 @@ sub debug {
 	my $log_entry = {jsonrpc => "2.0",method  => "notifications/log",params  => {level     => "debug",message   => $message,timestamp => strftime("%Y-%m-%d %H:%M:%S", localtime)}};
 	print STDERR encode_json($log_entry) . "\n";
 }
+# Send VM output notification
+sub send_vm_output_notification {
+	my ($vm_name, $stream, $chunk) = @_;
+	my $notification = {
+		jsonrpc => "2.0",
+		method => "notifications/vm_output",
+		params => {
+			vm => $vm_name,
+			stream => $stream,
+			chunk => $chunk,
+			timestamp => strftime("%Y-%m-%dT%H:%M:%S.000Z", gmtime)
+		}
+	};
+	my $notification_json = encode_json($notification);
+	print STDOUT $notification_json . "\n";
+	debug("Sent VM output notification for $vm_name ($stream): " . length($chunk) . " bytes");
+}
 # Error helper that returns JSON string
 sub _error {
 	my ($id, $code, $message, $data) = @_;
@@ -562,9 +579,10 @@ sub monitor_bridge {
 		# VM data from PTY master → buffer + all clients
 		my $buffer;
 		my $bytes = sysread($bridge->{pty}, $buffer, 4096);
-		next if $!{EINTR} || $!{EAGAIN};
 		if (defined $bytes && $bytes > 0) {
 			debug("Monitor: Read $bytes bytes from VM via PTY");
+			# Send live output notification
+			send_vm_output_notification($vm_name, "stdout", $buffer);
 			# Update buffer for read
 			my $text = $buffer;
 			$text =~ s/\r/\n/g;
@@ -577,7 +595,6 @@ sub monitor_bridge {
 			debug("Monitor: Forwarding to $client_count clients");
 			for my $client (values %{ $bridge->{session}->{clients} }) {
 				eval { syswrite($client, $buffer); };
-				next if $!{EINTR} || $!{EAGAIN};
 			}
 		}elsif (defined $bytes && $bytes == 0) {
 			debug("Server: PTY for $vm_name signaled EOF - VM bridge likely died");
@@ -602,18 +619,15 @@ sub monitor_bridge {
 				my $history = join("\n",@{ $bridge->{buffer} }[ $start .. $#{ $bridge->{buffer} } ]). "\n";
 				debug("Monitor: Sending history (" . length($history) . " bytes) to new client");
 				eval { syswrite($client, $history); };
-				next if $!{EINTR} || $!{EAGAIN};
 			}
 		}
 	}elsif (exists $bridge->{session}->{clients}->{ fileno($fh) }) {
 		# Data from terminal window client → VM via PTY master
 		my $buffer;
 		my $bytes = sysread($fh, $buffer, 4096);
-		next if $!{EINTR} || $!{EAGAIN};
 		if (defined $bytes && $bytes > 0) {
 			debug("Monitor: Read $bytes bytes from client, forwarding to VM");
 			syswrite($bridge->{pty}, $buffer);
-			next if $!{EINTR} || $!{EAGAIN};
 		}else {
 			# Client disconnected
 			my $client_id = fileno($fh);

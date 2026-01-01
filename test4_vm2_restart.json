@@ -1,1 +1,0 @@
-{"jsonrpc":"2.0","id":13,"result":{"content":[{"type":"text","text":"{\"success\":1,\"socket\":\"/tmp/serial_vm2\",\"message\":\"Bridge started for VM: vm2\",\"port\":\"4557\"}"}]}}

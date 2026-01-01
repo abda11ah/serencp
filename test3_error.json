@@ -1,2 +1,0 @@
-{"id":8,"result":{"content":[{"type":"text","text":"{\"vm_name\":\"nonexistent\",\"buffer_size\":0,\"running\":0,\"port\":null}"}]},"jsonrpc":"2.0"}
-{"jsonrpc":"2.0","id":9,"result":{"content":[{"type":"text","text":"{\"error\":\"Bridge not running for VM: nonexistent. Use start to start it.\"}"}]}}

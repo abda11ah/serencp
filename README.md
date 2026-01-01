@@ -20,7 +20,6 @@ It uses `IO::Pty` to create a pseudo-terminal (PTY) for the VM serial console. I
 - Perl with `IO::Pty` and `JSON::PP` modules installed.
 - VM running with serial console on a TCP port (default starts at 4555).
 - It does not require root permissions.
-- It does not require root permissions.
 - **Automatic Terminal Feature**: Requires a supported terminal emulator to automatically spawn a window. It uses an internal client mode and does **not** require `socat`.
 
 ### Supported Terminal Emulators
@@ -116,31 +115,77 @@ Executes a specific tool.
   }
   ```
 
+## Live Output Notifications
+
+The server now supports real-time VM output streaming through MCP protocol notifications. This provides immediate feedback without requiring polling.
+
+### Notification Format
+VM output is automatically streamed as JSON-RPC 2.0 notifications:
+
+```json
+{
+    "jsonrpc": "2.0",
+    "method": "notifications/vm_output",
+    "params": {
+        "vm": "vm1",
+        "stream": "stdout",
+        "chunk": "output data here",
+        "timestamp": "2026-01-01T08:45:23.000Z"
+    }
+}
+```
+
+### Notification Parameters
+- **vm**: Name of the VM generating the output
+- **stream**: Stream type ("stdout" or "stderr")
+- **chunk**: The actual output data chunk
+- **timestamp**: ISO 8601 timestamp when the chunk was received
+
+### Client-Side Handling
+MCP clients can listen for notifications:
+
+```javascript
+client.on('notification', (notification) => {
+    if (notification.method === 'notifications/vm_output') {
+        const { vm, stream, chunk, timestamp } = notification.params;
+        console.log(`[${timestamp}] ${vm} (${stream}): ${chunk}`);
+        // Render live output to UI
+    }
+});
+```
+
+### Benefits
+- **Real-time Feedback**: VM output appears immediately without polling
+- **Efficient**: Push-based model reduces overhead compared to polling
+- **Timestamped**: Each chunk includes precise timing information
+- **Backward Compatible**: Existing `read` tool continues to work for pull-based access
+
 ## Available Tools
 
 ### 1. `start`
 Starts the bridge for a specific VM. If a bridge already exists, it is restarted to ensure a **clean slate**.
 **New behavior**: Automatically spawns a graphical terminal window linked to the session using the internal client of `sercov.pl`.
-- **Arguments**: `{"VM_NAME": "string", "PORT": "number"}` (PORT is optional, default: 4555)
-- **Example**: `tools/call {"name": "start", "arguments": {"VM_NAME": "MYVM", "PORT": 4555}}`
+- **Arguments**: `{"vm_name": "string", "port": "number"}` (port is optional, default: 4555)
+- **Returns**: `{"success": true, "message": "...", "port": 4555, "socket": "/tmp/...", "session_id": "session_..."}`
+- **Example**: `tools/call {"name": "start", "arguments": {"vm_name": "MYVM", "port": 4555}}`
 
 ### 2. `status`
 Checks the status of the bridge.
-- **Arguments**: `{"VM_NAME": "string"}`
-- **Returns**: Running status, port, and buffer size.
+- **Arguments**: `{"vm_name": "string"}`
+- **Returns**: `{"running": true/false, "vm_name": "...", "port": ..., "buffer_size": ...}`
 
 ### 3. `read`
 Reads the last 100 lines from the VM serial console ring buffer.
-- **Arguments**: `{"VM_NAME": "string"}`
+- **Arguments**: `{"vm_name": "string"}`
 - **Returns**: `{"success": true, "output": "..."}`
 
 ### 4. `write`
 Sends a command to the VM serial console.
-- **Arguments**: `{"VM_NAME": "string", "text": "command"}`
+- **Arguments**: `{"vm_name": "string", "text": "command"}`
 
 ### 5. `stop`
 Stops the bridge for a specific VM.
-- **Arguments**: `{"VM_NAME": "string"}`
+- **Arguments**: `{"vm_name": "string"}`
 
 ## Architecture
 
@@ -152,16 +197,16 @@ graph TD
     MCP["sercov MCP Server (Main Event Loop)"]
     Client["MCP Client (LLM / Opencode)"]
     UnixSocket["Unix Socket (/tmp/serial_VM_NAME)"]
-    TermClients["Terminal Clients (socat / minicom)"]
     ScriptClient["sercov.pl --socket=/tmp/serial_VM_NAME"]
+    ExtClients["External Clients (optional)"]
 
     VM <--> Bridge
     Bridge <--> PTY
     PTY <--> MCP
     MCP <--> Client
     MCP <--> UnixSocket
-    UnixSocket <--> TermClients
     UnixSocket <--> ScriptClient
+    UnixSocket -.-> ExtClients
 ```
 
 The parent MCP server uses `IO::Select` to multiplex:
@@ -177,10 +222,27 @@ For direct interaction outside of the MCP environment, you can use the script it
 ```bash
 ./sercov.pl --socket=/tmp/serial_MYVM
 ```
-New connections automatically receive the last 50 lines of history.
+New connections automatically receive the last 50 lines of history. Live output notifications are sent automatically when VM data is received, providing real-time streaming without polling.
 
 ## Troubleshooting
 - **Failed to get tools**: Ensure the script is run in an environment where standard input/output is captured. Use `tools/list` to verify connectivity.
 - **Bridge not running**: Call `start` before attempting to read or write.
+- **No live notifications**: Ensure your MCP client supports notification handling. Notifications are sent automatically when VM output is received.
 - **Socket Permission**: Ensure `/tmp` is writable by the user running the MCP server.
 - **Syntax Check**: Run `perl -c sercov.pl` to verify script integrity.
+
+## Testing
+
+The implementation includes comprehensive test files:
+
+- **`test_notification_function.pl`**: Tests the notification function directly
+- **`test_backward_compatibility.pl`**: Verifies existing tools still work
+- **`mock_vm_notifications.py`**: Mock VM server for testing
+- **`test_live_notifications.sh`**: Integration test script
+
+Run tests with:
+```bash
+perl test_notification_function.pl
+perl test_backward_compatibility.pl
+./test_live_notifications.sh
+```
