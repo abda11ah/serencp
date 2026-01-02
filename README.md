@@ -1,4 +1,4 @@
-# SERENCP - The Serenity Serial Console viewer MCP Server Usage Guide
+# SERENCP - The Serial Console viewer MCP Server Usage Guide
 
 (tested with QEMU/KVM/virt-manager and OpenCode)
 
@@ -273,3 +273,9 @@ New connections automatically receive the last 50 lines of history. Live output 
 - **No live notifications**: Ensure your MCP client supports notification handling. Notifications are sent automatically when VM output is received.
 - **Socket Permission**: Ensure `/tmp` is writable by the user running the MCP server.
 - **Syntax Check**: Run `perl -c serencp.pl` to verify script integrity.
+
+## About
+
+The name `serencp` is a play on words:
+- `seren` - Serenity / Serial
+- `cp` - MCP (Model Context Protocol)
