@@ -28,7 +28,7 @@ our $DEFAULT_VM_PORT   = 4555;
 our $RING_BUFFER_SIZE  = 1000;
 our $MAX_BUFFER_BYTES  = 10 * 1024 * 1024;  # 10MB per VM
 our $CONSOLE_HISTORY_LINES = 50;  # Lines of history to send to new console clients
-our $DEBUG             = 1;  # Enable debug output
+our $DEBUG             = 0;  # Enable debug output
 # Cleanup timeout configuration
 our $SIGTERM_TIMEOUT   = 5;   # Seconds to wait for SIGTERM to work
 our $SIGKILL_WAIT      = 1;   # Seconds to wait after SIGKILL
@@ -530,7 +530,7 @@ sub bridge_process_child {
 			$text =~ s/\r/\n/g;
 			for my $l (split /\n/, $text) {
 				next unless $l;  # Skip empty lines
-				# Add line to buffer
+				 # Add line to buffer
 				push @initial_buffer, $l;
 				# Enforce line count limit only (byte limit is unnecessary for temporary buffer)
 				while (@initial_buffer > $initial_buffer_size) {
@@ -906,12 +906,7 @@ sub spawn_terminal_client {
 					my $error_notification = {
 						jsonrpc => "2.0",
 						method  => "notifications/log",
-						params  => {
-							level     => MCP_LOG_LEVEL_ERROR,
-							message   => "Terminal exec failed: $!",
-							timestamp => strftime("%Y-%m-%d %H:%M:%S", localtime),
-							vm_name   => $vm_name
-						}
+						params  => {level     => MCP_LOG_LEVEL_ERROR,message   => "Terminal exec failed: $!",timestamp => strftime("%Y-%m-%d %H:%M:%S", localtime),vm_name   => $vm_name}
 					};
 					print STDOUT encode_json($error_notification) . "\n";
 					debug("Terminal exec failed: $!");
@@ -922,12 +917,7 @@ sub spawn_terminal_client {
 				my $error_notification = {
 					jsonrpc => "2.0",
 					method  => "notifications/log",
-					params  => {
-						level     => MCP_LOG_LEVEL_ERROR,
-						message   => "Child process error: $@",
-						timestamp => strftime("%Y-%m-%d %H:%M:%S", localtime),
-						vm_name   => $vm_name
-					}
+					params  => {level     => MCP_LOG_LEVEL_ERROR,message   => "Child process error: $@",timestamp => strftime("%Y-%m-%d %H:%M:%S", localtime),vm_name   => $vm_name}
 				};
 				print STDOUT encode_json($error_notification) . "\n";
 				debug("Child process error: $@");
@@ -975,7 +965,14 @@ sub run_unix_socket_client {
 		for my $fh ($sel->can_read) {
 			my $buf;
 			my $n = sysread($fh, $buf, 4096);
-			exit if !defined($n) || $n == 0;
+			if (!defined($n)) {
+				print STDERR "Error reading from file handle: $!\n";
+				exit 1;
+			}
+			if ($n == 0) {
+				print STDERR "Connection closed by peer\n";
+				exit 0;
+			}
 			if ($fh == \*STDIN) {
 				syswrite($sock, $buf);
 			}else {
