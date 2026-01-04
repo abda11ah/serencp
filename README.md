@@ -1,4 +1,4 @@
-# SERENCP - The Serial Console viewer MCP Server Usage Guide
+# SERENCP - VM Console MCP Server & live viewer Usage Guide
 
 (tested with QEMU/KVM/virt-manager and OpenCode)
 
