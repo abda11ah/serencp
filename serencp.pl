@@ -405,13 +405,14 @@ sub start_bridge {
 	my ($vm_name, $port) = @_;
 	$port = $DEFAULT_VM_PORT unless defined $port;
 	debug("Creating bridge for $vm_name on port $port");
-	# Create PTY
-	my $pty = IO::Pty->new();
-	unless ($pty) {
-		debug("Failed to create PTY");
-		return {jsonrpc => "2.0",id      => undef,error   => {code    => MCP_SERVER_ERROR,message => "Failed to create PTY for VM: $vm_name"}};
-	}
-	debug("PTY created successfully");
+  # Create PTY
+  my $pty = IO::Pty->new();
+  unless ($pty) {
+    debug("Failed to create PTY");
+    return {jsonrpc => "2.0",id      => undef,error   => {code    => MCP_SERVER_ERROR,message => "Failed to create PTY for VM: $vm_name"}};
+  }
+  binmode($pty);
+  debug("PTY created successfully");
 	# Create a pipe for child to signal readiness
 	my ($read_pipe, $write_pipe);
 	unless (pipe($read_pipe, $write_pipe)) {
@@ -457,14 +458,15 @@ sub start_bridge {
 	my $socket_path = "/tmp/serial_${vm_name}";
 	debug("Parent process: Creating Unix socket at $socket_path");
 	unlink $socket_path if -e $socket_path;
-	my $socket = IO::Socket::UNIX->new(Type  => SOCK_STREAM,Local => $socket_path,Listen => 1);
-	unless ($socket) {
-		debug("Failed to create socket: $!");
-		terminate_process($pid, "bridge child process for VM $vm_name (socket creation failed)") if $pid;
-		$pty->close();
-		return {jsonrpc => "2.0",id      => undef,error   => {code    => MCP_SERVER_ERROR,message => "Failed to create Unix socket for VM: $vm_name :".$!}};
-	}
-	debug("Parent process: Unix socket created successfully");
+  my $socket = IO::Socket::UNIX->new(Type  => SOCK_STREAM,Local => $socket_path,Listen => 1);
+  unless ($socket) {
+    debug("Failed to create socket: $!");
+    terminate_process($pid, "bridge child process for VM $vm_name (socket creation failed)") if $pid;
+    $pty->close();
+    return {jsonrpc => "2.0",id      => undef,error   => {code    => MCP_SERVER_ERROR,message => "Failed to create Unix socket for VM: $vm_name :".$!}};
+  }
+  binmode($socket);
+  debug("Parent process: Unix socket created successfully");
 	# Set up select - add pipe to monitor child readiness
 	my $select = IO::Select->new();
 	$select->add($pty);
@@ -540,9 +542,11 @@ sub start_bridge {
 sub bridge_process_child {
 	my ($vm_socket, $pty_slave) = @_;
 	debug("Bridge child: Starting data bridge between VM and PTY");
-	# Set both sockets to non-blocking mode immediately
-	$vm_socket->blocking(0);
-	$pty_slave->blocking(0);
+  # Set both sockets to non-blocking mode immediately
+  $vm_socket->blocking(0);
+  $pty_slave->blocking(0);
+  binmode($vm_socket);
+  binmode($pty_slave);
 	# Set up select for multiplexing VM socket and PTY slave
 	my $select = IO::Select->new();
 	$select->add($vm_socket);
@@ -710,13 +714,14 @@ sub monitor_bridge {
 			start_bridge($vm_name, $port);
 		}
 	}elsif ($fh == $bridge->{socket}) {
-		# New client connection
-		my $client = $bridge->{socket}->accept();
-		if ($client) {
-			$client->blocking(0); # Ensure non-blocking
-			my $client_id = fileno($client);
-			$bridge->{session}->{clients}->{$client_id} = $client;
-			$bridge->{select}->add($client);  # Add to bridge's dedicated select
+      # New client connection
+      my $client = $bridge->{socket}->accept();
+      if ($client) {
+        $client->blocking(0); # Ensure non-blocking
+        binmode($client);
+        my $client_id = fileno($client);
+        $bridge->{session}->{clients}->{$client_id} = $client;
+        $bridge->{select}->add($client);  # Add to bridge's dedicated select
 			debug("Monitor: New client connected with ID $client_id");
 			# Send current buffer content to new client
 			if (@{ $bridge->{buffer} }) {
@@ -960,12 +965,13 @@ sub spawn_terminal_client {
 }
 # Internal Unix-socket client implementation
 sub run_unix_socket_client {
-	my ($socket_path) = @_;
-	my $sock = IO::Socket::UNIX->new(Type => SOCK_STREAM,Peer => $socket_path);
-	unless ($sock) {
-		print STDERR "Cannot connect to $socket_path: $!\n";
-		exit 1;
-	}
+  my ($socket_path) = @_;
+  my $sock = IO::Socket::UNIX->new(Type => SOCK_STREAM,Peer => $socket_path);
+  unless ($sock) {
+    print STDERR "Cannot connect to $socket_path: $!\n";
+    exit 1;
+  }
+  binmode($sock);
 	my $sel = IO::Select->new();
 	$sel->add(\*STDIN);
 	$sel->add($sock);
