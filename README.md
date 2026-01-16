@@ -58,7 +58,7 @@ The script will automatically detect which terminal is available on your system 
 - **Ring Buffer Size**: 1000 lines
 - **Max Buffer Bytes**: 10MB per VM
 - **Console History Lines**: 60 lines (sent to new clients)
-- **Read Timeout**: 20 seconds (for read tool)
+- **Read Timeout**: 10 seconds (for read tool)
 
 ### MCP Server Configuration
 Make sure the MCP server is configured in `opencode.jsonc`:
@@ -136,34 +136,34 @@ VM output is automatically streamed as JSON-RPC 2.0 notifications:
 ```json
 {
     "jsonrpc": "2.0",
-    "method": "notifications/message",
+    "method": "notifications/tool_stream",
     "params": {
-        "level": "info",
-        "logger": "vm",
-        "data": {
-            "vm": "vm1",
-            "stream": "stdout",
-            "chunk": "output data here",
-            "timestamp": "2026-01-01T08:45:23.000Z"
-        }
+        "toolName": "serencp/vm1",
+        "content": [
+            {
+                "type": "text",
+                "text": "output data here"
+            }
+        ],
+        "isError": false
     }
 }
 ```
 
 ### Notification Parameters
-- **vm**: Name of the VM generating the output
-- **stream**: Stream type ("stdout" or "stderr")
-- **chunk**: The actual output data chunk
-- **timestamp**: ISO 8601 timestamp when the chunk was received
+- **toolName**: The tool identifier in format "serencp/{vm_name}"
+- **content**: Array containing the output data with type and text fields
+- **isError**: Boolean flag indicating if this is an error message
 
 ### Client-Side Handling
 MCP clients can listen for notifications:
 
 ```javascript
 client.on('notification', (notification) => {
-    if (notification.method === 'notifications/message' && notification.params.logger === 'vm') {
-        const { vm, stream, chunk, timestamp } = notification.params.data;
-        console.log(`[${timestamp}] ${vm} (${stream}): ${chunk}`);
+    if (notification.method === 'notifications/tool_stream' && notification.params.toolName.startsWith('serencp/')) {
+        const vmName = notification.params.toolName.replace('serencp/', '');
+        const content = notification.params.content[0];
+        console.log(`[${vmName}]: ${content.text}`);
         // Render live output to UI
     }
 });
@@ -209,7 +209,7 @@ Checks the status of the bridge.
 - **Returns**: `{"running": true/false, "vm_name": "...", "port": ..., "buffer_size": ...}`
 
 ### 3. `read`
-Reads output from VM serial console with a 20-second timeout. Returns the last 60 lines from the ring buffer.
+Reads output from VM serial console with a 10-second timeout. Returns the last 60 lines from the ring buffer.
 - **Arguments**: `{"vm_name": "string"}`
 - **Returns**: `{"success": true, "output": "..."}`
 
