@@ -15,6 +15,7 @@ use Time::HiRes qw(sleep time);
 # ====================== Configuration ======================
 our %options;
 GetOptions(\%options, 'host=s', 'http-port=i') or exit 1;
+our $NAME             = "serencp";
 our $VERSION          = "2.0";
 our $PROTOCOL_VERSION = "2025-06-18";
 our $DEFAULT_VM_PORT  = 4555;
@@ -298,7 +299,7 @@ sub queue_http_response {
 	return unless exists $http_conns{$fd};
 	my %h = (
 		'Date'                        => http_date(),
-		'Server'                      => "serencp/$VERSION",
+		'Server'                      => "$NAME/$VERSION",
 		'Access-Control-Allow-Origin' => '*',
 		'Access-Control-Allow-Headers'=> 'Content-Type, Accept, Mcp-Session-Id, MCP-Protocol-Version, Origin, Last-Event-ID',
 		'Access-Control-Allow-Methods'=> 'GET, POST, DELETE, OPTIONS',
@@ -342,7 +343,7 @@ sub queue_sse_open_response {
 	my $resp = "HTTP/1.1 200 OK\r\n";
 	my %h = (
 		'Date'              => http_date(),
-		'Server'            => "serencp/$VERSION",
+		'Server'            => "$NAME/$VERSION",
 		'Content-Type'      => 'text/event-stream; charset=utf-8',
 		'Cache-Control'     => 'no-cache, no-transform',
 		'X-Accel-Buffering' => 'no',
@@ -631,7 +632,7 @@ sub handle_request {
 					tools      => { listChanged => JSON::PP::true },
 					},
 				serverInfo => {
-					name        => "serencp",
+					name        => $NAME,
 					version     => $VERSION,
 					description => "MCP Streamable HTTP server for VM serial console communication.",
 					},

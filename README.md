@@ -103,7 +103,85 @@ You can also specify a terminal explicitly:
 }
 ```
 
-### HTTP Experimental Server (`http_experimental.pl`)
+### HTTP Streamable Server (`http_streamable.pl`) (still experimental)
+
+`http_streamable.pl` is the **Streamable HTTP** MCP server (v2.0) exposing 8 tools
+(`start`, `stop`, `status`, `read`, `write`, `exec`, `unsubscribe`, `reload_tools`)
+over HTTP. It listens by default on `http://127.0.0.1:8080/mcp` (auto-switches to
+the next free port when taken) and follows the MCP spec 2025-06-18 transports:
+per-request SSE answers, a standalone `GET` SSE stream for server-initiated
+notifications, and session IDs via `Mcp-Session-Id`. Launch it with:
+
+```bash
+./http_streamable.pl --http-port 8081 &
+```
+
+Then register it as a **remote** MCP server:
+
+Opencode example (`~/.opencode/opencode.jsonc`)
+
+```json
+"mcp": {
+    "serencp": {
+        "type": "remote",
+        "url": "http://127.0.0.1:8081/mcp",
+        "enabled": true
+    }
+}
+```
+
+Example for other clients
+
+```json
+{
+  "mcpServers": {
+    "serencp": { "url": "http://127.0.0.1:8081/mcp" }
+  }
+}
+```
+
+Then open the **MCP Servers** panel and click **Reload** (CLI: `/mcp reload`).
+
+#### Live VM answers without polling (`exec`)
+
+`write` returns as soon as the command is sent; use **`exec`** to send a command
+*and wait for the answer in the same call* — no `read` polling needed:
+
+```json
+{"name": "exec", "arguments": {"vm_name": "MYVM", "text": "ls -l /"}}
+```
+
+`exec` waits up to `timeout` seconds (default 15, max 60) and finishes early after
+`quiet_ms` milliseconds with no new output (default 1200). While it waits, VM
+output streams as `notifications/vm/output` events (plus `notifications/progress`
+when the client passes a `progressToken`) on the call's own SSE stream, and the
+full answer is returned in the result (`output`, `bytes`, `timed_out`).
+
+The legacy `subscriptions/listen` SSE stream still works for clients that hold it
+open, and any client can hold the standard `GET /mcp` SSE stream to receive
+server-initiated notifications (`notifications/vm/output`,
+`notifications/tools/list_changed`, `notifications/resources/*`).
+
+#### Refreshing the tool list (`reload_tools`)
+
+Call the `reload_tools` tool to broadcast `notifications/tools/list_changed` so
+connected clients re-list tools. Each call bumps a `[list generation N]` marker
+on its own description, making refreshes observable. When developing the server
+itself, run with `--watch` to auto-restart on file change (restarts drop
+sessions/bridges; clients recover by re-initializing):
+
+```bash
+./http_streamable.pl --http-port 8081 --watch &
+```
+
+#### Test setup (`mockvm.pl`)
+
+`mockvm.pl` simulates a VM serial console on TCP `127.0.0.1:4555` (GRUB menu,
+multilingual boot messages, login prompt). Note it **hangs up idle connections
+after ~30 s**, so the bridge restarts (fresh reboot) when idle that long — run
+`start` → `exec` promptly in tests.
+
+### HTTP Experimental Server (`http_experimental.pl`) (older version, works fine but still have to poll the read tool after each call to 'write' tool)
 
 `http_experimental.pl` is an experimental **Streamable HTTP** MCP server (v2.0) exposing the same 5 tools (`start`, `stop`, `status`, `read`, `write`) over HTTP instead of stdio. It listens by default on `http://127.0.0.1:8080/mcp`, uses Server-Sent Events (SSE) to stream live VM output notifications (but still need 'read' tool to get after each call to 'write' tool (current limitation, needs more investigation)), and supports session-based resource subscriptions with CORS enabled. Launch it with:
 

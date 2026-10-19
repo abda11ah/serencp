@@ -176,43 +176,90 @@ while (1) {
     while (waitpid(-1, WNOHANG) > 0) { }
 }
 
+sub grub_menu_text {
+    my ($sel) = @_;
+    my @opts = ('Ubuntu', 'Advanced options for Ubuntu');
+    my $out = "\nGNU GRUB  version 2.06\n\n";
+    $out .= "┌────────────────────────────────────────────────────────────┐\n";
+    for my $i (0 .. $#opts) {
+        my $mark = $i == $sel ? '*' : ' ';
+        my $line = $mark . $opts[$i];
+        $line = substr($line . (' ' x 60), 0, 60);
+        $out .= "│$line│\n";
+    }
+    $out .= "│" . (' ' x 60) . "│\n" for 1 .. 10;
+    $out .= "└────────────────────────────────────────────────────────────┘\n";
+    $out .= "\nUse the \x{2191} and \x{2193} keys to select which entry is highlighted.\n";
+    $out .= "Press enter to boot the selected OS, `e' to edit the commands\n";
+    $out .= "before booting or `c' for a command-line.\n";
+    return $out;
+}
+
+# Interactive GRUB selection over serial/TCP.
+# Mirrors the local `sub choice` interaction: ↑/↓ to move, Enter to
+# boot, `e'/`c' for edit/command-line, `q' to abort. Redraws with
+# ANSI cursor-up + clear (same idea as $draw closure). Falls back to
+# entry 0 after $timeout seconds (better simulation than sleep+fixed).
+sub grub_choice {
+    my ($client, @opts) = @_;
+    my ($sel, $printed) = (0, 0);
+    my $draw = sub {
+        my $menu = grub_menu_text($sel);
+        if ($printed++) {
+            # Move cursor up over previous menu block then clear to end.
+            # Block height: blank + title + blank + 14 box lines + 3 help lines
+            # \e[<n>A + \e[J replicates local "\e[".(@opts+2)."A\e[J" strategy.
+            print $client "\e[19A\e[J";
+        }
+        print $client encode_utf8($menu);
+    };
+    $draw->();
+    my $sel_in = IO::Select->new($client);
+    my $deadline = time() + 5;
+    my $esc_buf = '';
+    while (1) {
+        my $tleft = $deadline - time();
+        if ($tleft <= 0) { return $sel; } # GRUB timeout -> boot highlighted
+        last unless $sel_in->can_read($tleft > 0 ? $tleft : 0);
+        my $buf = '';
+        my $n = sysread($client, $buf, 64);
+        return undef unless defined $n && length $buf;
+        for my $k (split //, $buf) {
+            if ($esc_buf ne '' || $k eq "\e") {
+                $esc_buf .= $k;
+                if ($esc_buf eq "\e") { next; }
+                elsif ($esc_buf eq "\e[") { next; }
+                elsif ($esc_buf =~ /^\e\[([AB])$/) {
+                    my $dir = $1;
+                    $sel = $dir eq 'A'
+                        ? ($sel == 0 ? $#opts : $sel - 1)
+                        : ($sel == $#opts ? 0 : $sel + 1);
+                    $draw->();
+                    $esc_buf = '';
+                }
+                else { $esc_buf = ($k eq "\e" ? $k : ''); }
+                next;
+            }
+            return $sel if $k =~ /[\r\n]/;
+            return undef if $k =~ /^[qQ]$/;
+            if ($k eq 'e' || $k eq 'c') {
+                print $client encode_utf8("\n[GRUB edit/command-line not supported in mock, booting selection " . ($sel + 1) . "...]\n");
+                return $sel;
+            }
+        }
+    }
+    return $sel;
+}
+
 sub handle_client {
     my ($client) = @_;
     
     $client->autoflush(1);
-    
-    # Send GRUB menu
-    my $grub_menu = <<'MENU';
+    binmode($client, ':raw');
 
-GNU GRUB  version 2.06
-
-┌────────────────────────────────────────────────────────────┐
-│*Ubuntu                                                     │
-│ Advanced options for Ubuntu                                │
-│                                                            │
-│                                                            │
-│                                                            │
-│                                                            │
-│                                                            │
-│                                                            │
-│                                                            │
-│                                                            │
-│                                                            │
-│                                                            │
-└────────────────────────────────────────────────────────────┘
-
-Use the ↑ and ↓ keys to select which entry is highlighted.
-Press enter to boot the selected OS, `e' to edit the commands
-before booting or `c' for a command-line.
-
-MENU
-    
-    print $client encode_utf8($grub_menu);
-    
-    # Auto-select option 1 after sending GRUB menu
-    # (simplified for testing - real VM would wait for input)
-    my $selection = 0;  # Always select Ubuntu
-    sleep(1);  # Brief pause to simulate GRUB timeout
+    my @entries = ('Ubuntu', 'Advanced options for Ubuntu');
+    my $selection = grub_choice($client, @entries);
+    $selection = 0 unless defined $selection && $selection =~ /^[01]$/;
     
     # Clear screen and show selection
     print $client "\n\nBooting selection " . ($selection + 1) . "...\n\n";
