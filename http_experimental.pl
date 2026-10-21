@@ -505,7 +505,7 @@ sub validate_streamable_http_headers {
 sub handle_http_request {
 	my ($fd, $req) = @_;
 	return unless $req;
-	my ($path)  = split /\?/, ($req->{target} // ''), 2;
+	my ($path)  = ($req->{target} // '') =~ m{^([^?]*)};
 	my $method  = $req->{method} || '';
 	my $headers = $req->{headers} || {};
 	if ($path ne $MCP_PATH) {
