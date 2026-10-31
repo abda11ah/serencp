@@ -144,7 +144,8 @@ my %TOOLS = (
 		description => "Send a command to the VM serial console and wait for its "
 			. "output, which streams back as notifications/vm/output and "
 			. "notifications/progress events on this call's SSE stream and is "
-			. "returned in full in the result. This is the no-polling path: "
+			. "returned in full in the result (the echoed command itself is "
+			. "stripped from `output`). This is the no-polling path: "
 			. "prefer it over write+read polling. The bridge must be started first.",
 		inputSchema => {
 			type       => "object",
@@ -213,7 +214,7 @@ sub safe_text {
 		1;
 		} or do {
 		$text = $raw_bytes;
-		$text =~ s/([^\x20-\x7E\r\n\t])/sprintf("\\x{%02X}", ord($1))/ge;
+		$text =~ s/([^\x20-\x7E\r\n\t])/sprintf("\\x{%02X}", ord($1))/ge; 
 		};
 	return $text;
 }
@@ -1044,6 +1045,36 @@ sub tool_read {
 		output  => safe_text($raw),
 		};
 }
+# Normalize the exact bytes a command is sent as: trailing newlines collapse to
+# a single "\n". Shared by `write` (which sends it) and `exec` (which needs the
+# same string to recognise the console echo in the gathered answer).
+sub normalize_newlines {
+	my ($text) = @_;
+	$text = '' unless defined $text;
+	$text =~ s/\n+$//;
+	return $text . "\n";
+}
+# Serial consoles echo commands back, so the first bytes an exec gathers are the
+# command that was just written, not the answer. Drop that echo (and its line
+# terminator) when it starts a line; anything else is left untouched so a real
+# answer that merely repeats the text is never truncated.
+sub strip_echoed_command {
+	my ($raw, $sent) = @_;
+	return $raw unless defined $raw && length($raw) && defined($sent) && length($sent);
+	# Match against bytes: $raw holds raw PTY bytes while $sent is characters.
+	my $sent_bytes = encode_utf8($sent);
+	my @lines = split /\r?\n/, $sent_bytes, -1;
+	pop @lines while @lines && $lines[-1] eq '';
+	return $raw unless @lines;
+	my $pattern = join('\r?\n', map { quotemeta($_) } @lines);
+	# The echo follows the write immediately, so only the leading bytes matter;
+	# scanning a small window also keeps huge answers cheap.
+	my $window = substr($raw, 0, 4096);
+	return $raw unless $window =~ /(?:\A|(?<=\n))$pattern(?:\r?\n)?/;
+	my ($start, $end) = ($-[0], $+[0]);
+	substr($raw, $start, $end - $start, '');
+	return $raw;
+}
 sub tool_write {
 	my ($params) = @_;
 	$params = {} unless ref($params) eq 'HASH';
@@ -1061,9 +1092,8 @@ sub tool_write {
 	# subscriptions/listen stream is what delivers notifications/vm/output
 	# events (see emit_vm_output). Otherwise the reply alone tells the client
 	# the command was sent, and `read` fetches the buffered answer.
-	$text =~ s/\n+$//;
-	$text .= "\n";
-	my $ok = write_all_nonblocking($bridge->{pty_in}, encode_utf8($text), 2.0);
+	my $payload = normalize_newlines($text);
+	my $ok = write_all_nonblocking($bridge->{pty_in}, encode_utf8($payload), 2.0);
 	return {
 		success => $ok ? JSON::PP::true : JSON::PP::false,
 		message => $ok ? "Command sent successfully" : "Failed to send command",
@@ -1113,6 +1143,8 @@ sub tool_exec {
 	$req_fd = undef unless defined $req_fd && exists $http_conns{$req_fd};
 	$http_conns{$req_fd}{close_after_write} = 0 if defined $req_fd;
 
+	# Keep the exact payload so the console echo can be removed from the answer.
+	my $sent = normalize_newlines($text);
 	my $send_result = tool_write({ vm_name => $vm_name, text => $text });
 	unless (ref($send_result) eq 'HASH' && $send_result->{success}) {
 		$http_conns{$req_fd}{close_after_write} = 1 if defined $req_fd && exists $http_conns{$req_fd};
@@ -1183,6 +1215,8 @@ sub tool_exec {
 	my @buf = @{ $bridges{$vm_name}{buffer} // [] };
 	my @new = $start_idx <= $#buf ? @buf[$start_idx .. $#buf] : @buf;
 	my $raw = join('', map { $$_ } @new);
+	# The VM echoes the command we just sent; return only the real answer.
+	$raw = strip_echoed_command($raw, $sent);
 	$http_conns{$req_fd}{close_after_write} = 1 if defined $req_fd && exists $http_conns{$req_fd};
 	my $timed_out = ($got_data && defined $quiet_deadline && time() >= $quiet_deadline) ? JSON::PP::false
 		: (time() >= $deadline ? JSON::PP::true : JSON::PP::false);
