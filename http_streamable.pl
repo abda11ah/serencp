@@ -419,17 +419,6 @@ sub queue_empty_response {
 		$close_after_write
 		);
 }
-# Decide whether a POST must be answered as an SSE stream instead of a plain
-# JSON body. The spec requires the client to ask for `text/event-stream`; if it
-# did not, the request is a normal one-shot call and stays a JSON response. A
-# notification (no id) is never streamed: it is answered 202 with no body.
-sub wants_stream {
-	my ($payload, $accept) = @_;
-	return '' unless ref($payload) eq 'HASH';
-	return 'notification' unless exists $payload->{id};
-	return 'stream' if ($accept || '') =~ m{text/event-stream};
-	return 'json';
-}
 sub queue_sse_open_response {
 	my ($fd, $sid, $long_lived) = @_;
 	return unless exists $http_conns{$fd};
@@ -681,7 +670,10 @@ sub handle_http_request {
 	}
 	my $payload;
 	eval {
-		$payload = decode_json(decode_utf8($req->{body}, FB_CROAK));
+		# JSON::PP::decode_json expects UTF-8 bytes and returns characters;
+		# decoding the body first makes it reject non-ASCII with "Wide
+		# character in subroutine entry".
+		$payload = decode_json($req->{body});
 		1;
 		} or do {
 		queue_json_response($fd, 400, jsonrpc_error(undef, MCP_PARSE_ERROR, "Parse error", $@ || "parse error"), {}, 1);
@@ -1054,10 +1046,12 @@ sub normalize_newlines {
 	$text =~ s/\n+$//;
 	return $text . "\n";
 }
-# Serial consoles echo commands back, so the first bytes an exec gathers are the
-# command that was just written, not the answer. Drop that echo (and its line
-# terminator) when it starts a line; anything else is left untouched so a real
-# answer that merely repeats the text is never truncated.
+# Serial consoles echo commands back, so the first bytes an exec gathers may
+# be the command that was just written. The bridge disables PTY echo and exec
+# starts from a flushed snapshot, so a real console echo is the very first
+# line of $raw. Only strip that exact leading echo. Never search later lines
+# or skip a prompt: an answer such as "You entered: ls" contains the command
+# text and must not be mistaken for an echo.
 sub strip_echoed_command {
 	my ($raw, $sent) = @_;
 	return $raw unless defined $raw && length($raw) && defined($sent) && length($sent);
@@ -1067,12 +1061,8 @@ sub strip_echoed_command {
 	pop @lines while @lines && $lines[-1] eq '';
 	return $raw unless @lines;
 	my $pattern = join('\r?\n', map { quotemeta($_) } @lines);
-	# The echo follows the write immediately, so only the leading bytes matter;
-	# scanning a small window also keeps huge answers cheap.
-	my $window = substr($raw, 0, 4096);
-	return $raw unless $window =~ /(?:\A|(?<=\n))$pattern(?:\r?\n)?/;
-	my ($start, $end) = ($-[0], $+[0]);
-	substr($raw, $start, $end - $start, '');
+	return $raw unless $raw =~ /\A$pattern[ \t]*(?:\r?\n|\z)/;
+	substr($raw, 0, $+[0], '');
 	return $raw;
 }
 sub tool_write {
@@ -1144,8 +1134,10 @@ sub tool_exec {
 	$http_conns{$req_fd}{close_after_write} = 0 if defined $req_fd;
 
 	# Keep the exact payload so the console echo can be removed from the answer.
+	# Pass the normalized form to tool_write so the bytes written and the bytes
+	# matched by strip_echoed_command() are provably the same string.
 	my $sent = normalize_newlines($text);
-	my $send_result = tool_write({ vm_name => $vm_name, text => $text });
+	my $send_result = tool_write({ vm_name => $vm_name, text => $sent });
 	unless (ref($send_result) eq 'HASH' && $send_result->{success}) {
 		$http_conns{$req_fd}{close_after_write} = 1 if defined $req_fd && exists $http_conns{$req_fd};
 		return $send_result;
@@ -1232,7 +1224,6 @@ sub tool_exec {
 	};
 }
 sub tool_reload_tools {
-	my ($params) = @_;
 	$RELOAD_GEN++;
 	send_tools_list_changed_notification();
 	debug("Tool list generation $RELOAD_GEN broadcast via notifications/tools/list_changed");
@@ -1418,7 +1409,7 @@ sub bridge_process_child {
 	close $_ for $vm_socket, $pty_in_slave, $pty_out_slave;
 }
 sub terminate_process {
-	my ($pid, $desc) = @_;
+	my ($pid) = @_;
 	return unless $pid && kill(0, $pid);
 	kill('TERM', $pid);
 	my $start = time();

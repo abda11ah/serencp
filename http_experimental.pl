@@ -1025,7 +1025,7 @@ sub bridge_process_child {
 	close $_ for $vm_socket, $pty_in_slave, $pty_out_slave;
 }
 sub terminate_process {
-	my ($pid, $desc) = @_;
+	my ($pid) = @_;
 	return unless $pid && kill(0, $pid);
 	kill('TERM', $pid);
 	my $start = time();

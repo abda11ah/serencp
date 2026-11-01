@@ -1466,7 +1466,7 @@ sub cleanup {
 	debug("Cleanup completed");
 }
 sub spawn_terminal_client {
-	my ($vm_name, $socket_in_path, $socket_out_path) = @_;
+	my ($vm_name, undef, $socket_out_path) = @_;
 	debug("Attempting to spawn terminal for VM: $vm_name");
 	my $term = detect_terminal();
 	my $terminal_config = $term;
